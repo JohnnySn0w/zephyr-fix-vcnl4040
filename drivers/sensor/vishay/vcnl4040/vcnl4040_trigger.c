@@ -37,27 +37,39 @@ static void vcnl4040_gpio_callback(const struct device *dev,
 	vcnl4040_handle_cb(data);
 }
 
+#ifdef CONFIG_VCNL4040_ENABLE_PROX
 static int vcnl4040_handle_proxy_int(const struct device *dev)
 {
 	struct vcnl4040_data *data = dev->data;
+	struct sensor_trigger proxy_trig = {
+		.type = SENSOR_TRIG_THRESHOLD,
+		.chan = SENSOR_CHAN_PROX,
+	};
 
-	if (data->proxy_handler != NULL) {
-		data->proxy_handler(dev, data->proxy_trigger);
+	if (data->proxy_handler) {
+		data->proxy_handler(dev, &proxy_trig);
 	}
 
 	return 0;
 }
+#endif
 
+#ifdef CONFIG_VCNL4040_ENABLE_ALS
 static int vcnl4040_handle_als_int(const struct device *dev)
 {
 	struct vcnl4040_data *data = dev->data;
+	struct sensor_trigger als_trig = {
+		.type = SENSOR_TRIG_THRESHOLD,
+		.chan = SENSOR_CHAN_LIGHT,
+	};
 
 	if (data->als_handler != NULL) {
-		data->als_handler(dev, data->als_trigger);
+		data->als_handler(dev, &als_trig);
 	}
 
 	return 0;
 }
+#endif
 
 static void vcnl4040_handle_int(const struct device *dev)
 {
@@ -65,19 +77,31 @@ static void vcnl4040_handle_int(const struct device *dev)
 	struct vcnl4040_data *data = dev->data;
 	uint16_t int_source;
 
+	k_sem_take(&data->sem, K_FOREVER);
+
 	if (vcnl4040_read(dev, VCNL4040_REG_INT_FLAG, &int_source)) {
 		LOG_ERR("Could not read interrupt source");
 		int_source = 0U;
 	}
 
+	k_sem_give(&data->sem);
 	data->int_type = int_source >> 8;
-
-	if (data->int_type == VCNL4040_PROXIMITY_AWAY ||
-	    data->int_type == VCNL4040_PROXIMITY_CLOSE) {
+	if ((data->int_type & BIT(VCNL4040_PROXIMITY_AWAY)) ||
+	    (data->int_type & BIT(VCNL4040_PROXIMITY_CLOSE))) {
+#ifdef CONFIG_VCNL4040_ENABLE_PROX
 		vcnl4040_handle_proxy_int(dev);
-	} else if (data->int_type == VCNL4040_AMBIENT_HIGH ||
-		   data->int_type == VCNL4040_AMBIENT_LOW) {
+#endif
+#ifndef CONFIG_VCNL4040_ENABLE_PROX
+		LOG_INF("proximity source triggered but not enabled");
+#endif
+	} else if ((data->int_type & BIT(VCNL4040_AMBIENT_HIGH)) ||
+		   (data->int_type & BIT(VCNL4040_AMBIENT_LOW))) {
+#ifdef CONFIG_VCNL4040_ENABLE_ALS
 		vcnl4040_handle_als_int(dev);
+#endif
+#ifndef CONFIG_VCNL4040_ENABLE_ALS
+		LOG_INF("ALS source triggered but not enabled");
+#endif
 	} else {
 		LOG_ERR("Unknown interrupt source %d", data->int_type);
 	}
@@ -86,13 +110,8 @@ static void vcnl4040_handle_int(const struct device *dev)
 }
 
 #ifdef CONFIG_VCNL4040_TRIGGER_OWN_THREAD
-static void vcnl4040_thread_main(void *p1, void *p2, void *p3)
+static void vcnl4040_thread_main(struct vcnl4040_data *data)
 {
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	struct vcnl4040_data *data = p1;
-
 	while (true) {
 		k_sem_take(&data->trig_sem, K_FOREVER);
 		vcnl4040_handle_int(data->dev);
@@ -119,12 +138,12 @@ int vcnl4040_attr_set(const struct device *dev,
 	const struct vcnl4040_config *config = dev->config;
 	int ret = 0;
 
-	if (config->int_gpio.port == NULL) {
+	if (!config->int_gpio.port) {
 		return -ENOTSUP;
 	}
 
-	k_mutex_lock(&data->mutex, K_FOREVER);
-
+	k_sem_take(&data->sem, K_FOREVER);
+#ifdef CONFIG_VCNL4040_ENABLE_PROX
 	if (chan == SENSOR_CHAN_PROX) {
 		if (attr == SENSOR_ATTR_UPPER_THRESH) {
 			if (vcnl4040_write(dev, VCNL4040_REG_PS_THDH,
@@ -147,11 +166,21 @@ int vcnl4040_attr_set(const struct device *dev,
 			goto exit;
 		}
 	}
+#endif
+
 #ifdef CONFIG_VCNL4040_ENABLE_ALS
 	if (chan == SENSOR_CHAN_LIGHT) {
+		//Never pass a number larger than allowed by integration time to this, it will overflow
+		uint16_t counts = (uint16_t) val->val1 / data->sensitivity; //convert given ambient lux value into counts for the register
+		//formula is counts = lux / integration time
 		if (attr == SENSOR_ATTR_UPPER_THRESH) {
+			if(counts >= 300)
+			{
+				counts = UINT16_MAX;
+			}
+			LOG_INF("setting upper thresh to: %u", (uint16_t)(counts*data->sensitivity));
 			if (vcnl4040_write(dev, VCNL4040_REG_ALS_THDH,
-					   (uint16_t)val->val1)) {
+					   counts)) {
 				ret = -EIO;
 				goto exit;
 			}
@@ -160,8 +189,9 @@ int vcnl4040_attr_set(const struct device *dev,
 			goto exit;
 		}
 		if (attr == SENSOR_ATTR_LOWER_THRESH) {
+			LOG_INF("setting lower thresh to: %u", (uint16_t)(counts*data->sensitivity));
 			if (vcnl4040_write(dev, VCNL4040_REG_ALS_THDL,
-					   (uint16_t)val->val1)) {
+					   counts)) {
 				ret = -EIO;
 				goto exit;
 			}
@@ -173,7 +203,7 @@ int vcnl4040_attr_set(const struct device *dev,
 #endif
 	ret = -ENOTSUP;
 exit:
-	k_mutex_unlock(&data->mutex);
+	k_sem_give(&data->sem);
 
 	return ret;
 }
@@ -191,11 +221,12 @@ int vcnl4040_trigger_set(const struct device *dev,
 		return -ENOTSUP;
 	}
 
-	k_mutex_lock(&data->mutex, K_FOREVER);
+	k_sem_take(&data->sem, K_FOREVER);
 
 	switch (trig->type) {
 	case SENSOR_TRIG_THRESHOLD:
 		if (trig->chan == SENSOR_CHAN_PROX) {
+#ifdef CONFIG_VCNL4040_ENABLE_PROX
 			if (vcnl4040_read(dev, VCNL4040_REG_PS_CONF, &conf)) {
 				ret = -EIO;
 				goto exit;
@@ -210,7 +241,7 @@ int vcnl4040_trigger_set(const struct device *dev,
 			}
 
 			data->proxy_handler = handler;
-			data->proxy_trigger = trig;
+#endif
 		} else if (trig->chan == SENSOR_CHAN_LIGHT) {
 #ifdef CONFIG_VCNL4040_ENABLE_ALS
 			if (vcnl4040_read(dev, VCNL4040_REG_ALS_CONF, &conf)) {
@@ -218,8 +249,8 @@ int vcnl4040_trigger_set(const struct device *dev,
 				goto exit;
 			}
 
-			/* ALS interrupt enable */
-			conf |= VCNL4040_ALS_INT_EN_MASK;
+			/* Set interrupt enable bit 1 */
+			conf |= 1 << 1;
 
 			if (vcnl4040_write(dev, VCNL4040_REG_ALS_CONF, conf)) {
 				ret = -EIO;
@@ -227,7 +258,6 @@ int vcnl4040_trigger_set(const struct device *dev,
 			}
 
 			data->als_handler = handler;
-			data->als_trigger = trig;
 #else
 			ret = -ENOTSUP;
 			goto exit;
@@ -243,7 +273,7 @@ int vcnl4040_trigger_set(const struct device *dev,
 		goto exit;
 	}
 exit:
-	k_mutex_unlock(&data->mutex);
+	k_sem_give(&data->sem);
 
 	return ret;
 }
@@ -252,17 +282,21 @@ int vcnl4040_trigger_init(const struct device *dev)
 {
 	const struct vcnl4040_config *config = dev->config;
 	struct vcnl4040_data *data = dev->data;
-
+	LOG_INF("setting trigger"); 
 	data->dev = dev;
 
+	/* dts doesn't have GPIO int pin set, so we dont support
+	 * trigger mode for this instance
+	 */
 	if (config->int_gpio.port == NULL) {
-		LOG_DBG("instance '%s' doesn't support trigger mode", dev->name);
+		LOG_WRN("no INT pin set for GPIO");
 		return 0;
 	}
 
 	/* Get the GPIO device */
-	if (!gpio_is_ready_dt(&config->int_gpio)) {
-		LOG_ERR_DEVICE_NOT_READY(config->int_gpio.port);
+	if (!device_is_ready(config->int_gpio.port)) {
+		LOG_ERR("%s: device %s is not ready", dev->name,
+				config->int_gpio.port->name);
 		return -ENODEV;
 	}
 
@@ -270,7 +304,7 @@ int vcnl4040_trigger_init(const struct device *dev)
 	k_sem_init(&data->trig_sem, 0, K_SEM_MAX_LIMIT);
 	k_thread_create(&data->thread, data->thread_stack,
 			CONFIG_VCNL4040_THREAD_STACK_SIZE,
-			vcnl4040_thread_main,
+			(k_thread_entry_t)vcnl4040_thread_main,
 			data, NULL, NULL,
 			K_PRIO_COOP(CONFIG_VCNL4040_THREAD_PRIORITY),
 			0, K_NO_WAIT);
@@ -285,7 +319,7 @@ int vcnl4040_trigger_init(const struct device *dev)
 			   BIT(config->int_gpio.pin));
 
 	if (gpio_add_callback(config->int_gpio.port, &data->gpio_cb) < 0) {
-		LOG_ERR("Failed to set gpio callback");
+		LOG_ERR("Failed to set gpio callback!");
 		return -EIO;
 	}
 

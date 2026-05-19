@@ -10,39 +10,35 @@
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/kernel.h>
 
 /* Registers all 16 bits */
-#define VCNL4040_REG_ALS_CONF		0x00
-#define VCNL4040_REG_ALS_THDH		0x01
-#define VCNL4040_REG_ALS_THDL		0x02
-#define VCNL4040_REG_PS_CONF		0x03
+#define VCNL4040_REG_ALS_CONF	0x00
+#define VCNL4040_REG_ALS_THDH	0x01
+#define VCNL4040_REG_ALS_THDL	0x02
+#define VCNL4040_REG_PS_CONF	0x03
 #define VCNL4040_REG_PS_MS		0x04
-#define VCNL4040_REG_PS_CANC		0x05
-#define VCNL4040_REG_PS_THDL		0x06
-#define VCNL4040_REG_PS_THDH		0x07
-#define VCNL4040_REG_PS_DATA		0x08
-#define VCNL4040_REG_ALS_DATA		0x09
-#define VCNL4040_REG_WHITE_DATA		0x0A
-#define VCNL4040_REG_INT_FLAG		0x0B
-#define VCNL4040_REG_DEVICE_ID		0x0C
+#define VCNL4040_REG_PS_CANC	0x05
+#define VCNL4040_REG_PS_THDL	0x06
+#define VCNL4040_REG_PS_THDH	0x07
+#define VCNL4040_REG_PS_DATA	0x08
+#define VCNL4040_REG_ALS_DATA	0x09
+#define VCNL4040_REG_WHITE_DATA	0x0A
+#define VCNL4040_REG_INT_FLAG	0x0B
+#define VCNL4040_REG_DEVICE_ID	0x0C
 
-#define VCNL4040_RW_REG_COUNT		0x08 /* [0x00, 0x07] */
+#define VCNL4040_DEFAULT_ID	0x0186
 
-#define VCNL4040_DEFAULT_ID		0x0186
-
-#define VCNL4040_LED_I_POS		8
-#define VCNL4040_PS_HD_POS		11
-#define VCNL4040_PS_HD_MASK		BIT(VCNL4040_PS_HD_POS)
-#define VCNL4040_PS_DUTY_POS		6
-#define VCNL4040_PS_IT_POS		1
-#define VCNL4040_PS_SD_POS		0
-#define VCNL4040_PS_SD_MASK		BIT(VCNL4040_PS_SD_POS)
-#define VCNL4040_ALS_IT_POS		6
-#define VCNL4040_ALS_INT_EN_POS		1
-#define VCNL4040_ALS_INT_EN_MASK	BIT(VCNL4040_ALS_INT_EN_POS)
-#define VCNL4040_ALS_SD_POS		0
-#define VCNL4040_ALS_SD_MASK		BIT(VCNL4040_ALS_SD_POS)
+#define VCNL4040_LED_I_POS	8
+#define VCNL4040_PS_HD_POS	11
+#define VCNL4040_PS_HD_MASK	(0x01 << VCNL4040_PS_HD_POS)
+#define VCNL4040_PS_DUTY_POS	6
+#define VCNL4040_PS_IT_POS	1
+#define VCNL4040_PS_SD_POS	0
+#define VCNL4040_PS_SD_MASK	(0x01 << VCNL4040_PS_SD_POS)
+#define VCNL4040_ALS_IT_POS	6
+#define VCNL4040_ALS_P_POS  2
+#define VCNL4040_ALS_SD_POS	0
+#define VCNL4040_ALS_SD_MASK	(0x01 << VCNL4040_ALS_SD_POS)
 
 enum led_current {
 	VCNL4040_LED_CURRENT_50MA,
@@ -69,6 +65,15 @@ enum ambient_integration_time {
 	VCNL4040_AMBIENT_INTEGRATION_TIME_640MS,
 };
 
+#ifdef CONFIG_VCNL4040_TRIGGER
+enum ambient_persistence {
+	VCNL4040_AMBIENT_PERSISTENCE_COUNT_1,
+	VCNL4040_AMBIENT_PERSISTENCE_COUNT_2,
+	VCNL4040_AMBIENT_PERSISTENCE_COUNT_4,
+	VCNL4040_AMBIENT_PERSISTENCE_COUNT_8,
+};
+#endif
+
 enum proximity_integration_time {
 	VCNL4040_PROXIMITY_INTEGRATION_TIME_1T,
 	VCNL4040_PROXIMITY_INTEGRATION_TIME_1_5T,
@@ -88,8 +93,9 @@ enum proximity_type {
 };
 
 enum interrupt_type {
-	VCNL4040_PROXIMITY_AWAY = 1,
+	VCNL4040_PROXIMITY_AWAY = 0,
 	VCNL4040_PROXIMITY_CLOSE,
+	//2-3 reserved
 	VCNL4040_AMBIENT_HIGH = 4,
 	VCNL4040_AMBIENT_LOW,
 };
@@ -102,23 +108,24 @@ struct vcnl4040_config {
 	enum led_current led_i;
 	enum led_duty_cycle led_dc;
 	enum ambient_integration_time als_it;
+#ifdef CONFIG_VCNL4040_TRIGGER
+	enum ambient_persistence als_pc;
+#endif
 	enum proximity_integration_time proxy_it;
 	enum proximity_type proxy_type;
 };
 
 struct vcnl4040_data {
-	struct k_mutex mutex;
+	struct k_sem sem;
 #ifdef CONFIG_VCNL4040_TRIGGER
 	const struct device *dev;
 	struct gpio_callback gpio_cb;
 	enum interrupt_type int_type;
 	sensor_trigger_handler_t proxy_handler;
-	const struct sensor_trigger *proxy_trigger;
 	sensor_trigger_handler_t als_handler;
-	const struct sensor_trigger *als_trigger;
 #endif
 #ifdef CONFIG_VCNL4040_TRIGGER_OWN_THREAD
-	K_KERNEL_STACK_MEMBER(thread_stack, CONFIG_VCNL4040_THREAD_STACK_SIZE);
+	K_THREAD_STACK_MEMBER(thread_stack, CONFIG_VCNL4040_THREAD_STACK_SIZE);
 	struct k_thread thread;
 	struct k_sem trig_sem;
 #endif
